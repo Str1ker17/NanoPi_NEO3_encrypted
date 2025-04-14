@@ -1,0 +1,12 @@
+# fdt      @ 0x08300000 (0x0000fee1)
+# kernel   @ 0x00280000 (0x01c6e200)
+# ramdisk  @ 0x0a200000 (0x00793fc0)
+
+setenv ipaddr 192.168.15.3
+setenv serverip 192.168.15.1
+tftp 0x00280000 nanopi/p6_kernel.hz
+tftp 0x0a200000 nanopi/p7_boot_re.cpio.gz
+tftp 0x08300000 nanopi/p5_resource_neo3.dtb
+
+setenv bootm-no-reloc y
+booti 0x00280000 0x0a200000:$(filesize) 0x08300000
