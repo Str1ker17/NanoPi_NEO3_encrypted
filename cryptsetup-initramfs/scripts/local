@@ -1,0 +1,618 @@
+# Local filesystem mounting			-*- shell-script -*-
+
+local_top()
+{
+	if [ "${local_top_used}" != "yes" ]; then
+		[ "${quiet?}" != "y" ] && log_begin_msg "Running /scripts/local-top"
+		run_scripts /scripts/local-top
+		[ "$quiet" != "y" ] && log_end_msg
+	fi
+	local_top_used=yes
+}
+
+local_block()
+{
+	[ "${quiet?}" != "y" ] && log_begin_msg "Running /scripts/local-block"
+	run_scripts /scripts/local-block "$@"
+	[ "$quiet" != "y" ] && log_end_msg
+}
+
+local_premount()
+{
+	if [ "${local_premount_used}" != "yes" ]; then
+		[ "${quiet?}" != "y" ] && log_begin_msg "Running /scripts/local-premount"
+		run_scripts /scripts/local-premount
+		[ "$quiet" != "y" ] && log_end_msg
+	fi
+	local_premount_used=yes
+}
+
+local_bottom()
+{
+	if [ "${local_premount_used}" = "yes" ] || [ "${local_top_used}" = "yes" ]; then
+		[ "${quiet?}" != "y" ] && log_begin_msg "Running /scripts/local-bottom"
+		run_scripts /scripts/local-bottom
+		[ "$quiet" != "y" ] && log_end_msg
+	fi
+	local_premount_used=no
+	local_top_used=no
+}
+
+# $1=device ID to mount
+# $2=optionname (for root and etc)
+# $3=panic if device is missing (true or false, default: true)
+# Sets $DEV to the resolved device node
+local_device_setup()
+{
+	local dev_id="$1"
+	local name="$2"
+	local may_panic="${3:-true}"
+	local real_dev
+	local time_elapsed
+	local count
+
+	# If wait-for-root understands this prefix, then use it to wait for
+	# the device rather than settling the whole of udev.
+
+	# Timeout is max(30, rootdelay) seconds (approximately)
+	local slumber=30
+	case $DPKG_ARCH in
+		powerpc|ppc64|ppc64el)
+			slumber=180
+			;;
+		*)
+			slumber=30
+			;;
+	esac
+	if [ "${ROOTDELAY:-0}" -gt $slumber ]; then
+		slumber=$ROOTDELAY
+	fi
+
+	case "$dev_id" in
+	UUID=*|LABEL=*|PARTUUID=*|/dev/*)
+		FSTYPE=$( wait-for-root "$dev_id" "$slumber" )
+		;;
+	*)
+		wait_for_udev 10
+		;;
+	esac
+
+	# Load ubi with the correct MTD partition and return since fstype
+	# doesn't work with a char device like ubi.
+	if [ -n "$UBIMTD" ]; then
+		/sbin/modprobe ubi "mtd=$UBIMTD"
+		DEV="${dev_id}"
+		return
+	fi
+
+	# Don't wait for a device that doesn't have a corresponding
+	# device in /dev and isn't resolvable by blkid (e.g. mtd0)
+	if [ "${dev_id#/dev}" = "${dev_id}" ] &&
+	   [ "${dev_id#*=}" = "${dev_id}" ]; then
+		DEV="${dev_id}"
+		return
+	fi
+
+	# If the root device hasn't shown up yet, give it a little while
+	# to allow for asynchronous device discovery (e.g. USB).  We
+	# also need to keep invoking the local-block scripts in case
+	# there are devices stacked on top of those.
+	#
+	# in Ubuntu, we should never actually enter this loop as wait-for-root
+	# above should have waited until the device appeared.
+	if ! real_dev=$(resolve_device "${dev_id}") ||
+	   ! get_fstype "${real_dev}" >/dev/null; then
+		log_begin_msg "Waiting for ${name}"
+
+		while true; do
+			sleep 1
+			time_elapsed="$(time_elapsed)"
+
+			local_block "${dev_id}"
+
+			# If mdadm's local-block script counts the
+			# number of times it is run, make sure to
+			# run it the expected number of times.
+			mdadm_exec=0
+			while true; do
+				if [ -f /run/count.mdadm.initrd ]; then
+					count="$(cat /run/count.mdadm.initrd)"
+				elif [ -n "${count}" ]; then
+					# mdadm script deleted it; put it back
+					count=$((count + 1))
+					echo "${count}" >/run/count.mdadm.initrd
+				else
+					break
+				fi
+				if [ "${count}" -ge "${time_elapsed}" ]; then
+					break;
+				fi
+
+				# Track that mdadm was executed to force
+				# cryptroot execution after the loop, see
+				# LP #1879980.
+				mdadm_exec=1
+				/scripts/local-block/mdadm "${dev_id}"
+
+				# Cryptroot must run here, see LP #1879980.
+				# The counter is inc/dec on cryptroot script!
+				if [ -f /run/cryptroot.initrd.cnt ]; then
+					crypt_cnt=$(cat /run/cryptroot.initrd.cnt)
+					if [ "${crypt_cnt}" -gt 0 ]; then
+						/scripts/local-block/cryptroot "${dev_id}"
+					fi
+				fi
+			done
+
+			# Extra cryptroot run after mdadm loop in order to
+			# start encrypted volumes on top of RAID arrays.
+			if [ -f /run/cryptroot.initrd.cnt ]; then
+				crypt_cnt=$(cat /run/cryptroot.initrd.cnt)
+				if [ "${crypt_cnt}" -gt 0 ] || [ ${mdadm_exec} -ne 0 ]; then
+					/scripts/local-block/cryptroot "${dev_id}"
+				fi
+			fi
+
+			if real_dev=$(resolve_device "${dev_id}") &&
+			   get_fstype "${real_dev}" >/dev/null; then
+				wait_for_udev 10
+				log_end_msg 0
+				break
+			fi
+			if [ "${time_elapsed}" -ge "${slumber}" ]; then
+				log_end_msg 1 || true
+				break
+			fi
+		done
+	fi
+
+	# We've given up, but we'll let the user fix matters if they can
+	while ! real_dev=$(resolve_device "${dev_id}") ||
+	      ! get_fstype "${real_dev}" >/dev/null; do
+		if ! $may_panic; then
+			echo "Gave up waiting for ${name}"
+			return 1
+		fi
+		echo "Gave up waiting for ${name} device.  Common problems:"
+		echo " - Boot args (cat /proc/cmdline)"
+		echo "   - Check rootdelay= (did the system wait long enough?)"
+		if [ "${name}" = root ]; then
+			echo "   - Check root= (did the system wait for the right device?)"
+		fi
+		echo " - Missing modules (cat /proc/modules; ls /dev)"
+		panic "ALERT!  ${dev_id} does not exist.  Dropping to a shell!"
+	done
+
+	DEV="${real_dev}"
+}
+
+local_part_reload_tiny()
+{
+	local BDEV=$1
+	local blkdev
+	local RESIZE_LOGFILE=/run/initramfs/resize2fs.log
+	if [[ "$BDEV" == /dev/sd* ]]; then
+		blkdev=${BDEV%[0-9]*}
+	else
+		blkdev=${BDEV%p*}
+	fi
+	logsave -a -s $RESIZE_LOGFILE partprobe ${blkdev}
+	[ $? -ne 0 ] && logsave -a -s $RESIZE_LOGFILE rrpart ${blkdev}
+}
+
+local_part_reload()
+{
+	local BDEV=$1
+	local_part_reload_tiny ${BDEV}
+	local_device_setup "${BDEV}" "${BDEV} file system"
+}
+
+local_resize_part()
+{
+	local BDEV=$1
+	local blkdev partnr resizeopts
+	local RESIZE_LOGFILE=/run/initramfs/resize2fs.log
+
+	if [[ "$BDEV" == /dev/sd* ]]; then
+		blkdev=${BDEV%[0-9]*}
+		partnr=$(echo $BDEV | tr -d -c 0-9)
+	else
+		blkdev=${BDEV%p*}
+		partnr=${BDEV#${blkdev}p}
+	fi
+	resizeopts="resizepart ${partnr} 100"
+
+	if sfdisk -l ${ROOT%p*} 2>&1 | grep -q "GPT PMBR size mismatch"; then
+		echo "write" | sfdisk ${ROOT%p*} -q --force 2>/dev/null
+	fi
+
+	if [ -b "${blkdev}" -a -n "${partnr}" ]; then
+		logsave -a -s $RESIZE_LOGFILE parted -s ${blkdev} unit % ${resizeopts} print
+		[ $? -eq 0 ] && local_part_reload ${BDEV}
+	fi
+}
+
+local_resize_btrfs()
+{
+	local BDEV=$1
+	local RESIZE_LOGFILE=/run/initramfs/resize2fs.log
+	[ "${quiet?}" != "y" ] && log_begin_msg "Resizing $TYPE file system on ${BDEV}"
+
+	logsave -a -s $RESIZE_LOGFILE btrfs filesystem resize max ${rootmnt}
+	resizepart_status="$?"
+
+	[ "$quiet" != "y" ] && log_end_msg
+}
+
+local_resize_ext4()
+{
+	local BDEV=$1
+	local RESIZE_LOGFILE=/run/initramfs/resize2fs.log
+	[ "${quiet?}" != "y" ] && log_begin_msg "Resizing $TYPE file system on ${BDEV}"
+
+	logsave -a -s $RESIZE_LOGFILE resize2fs -f ${BDEV}
+	resizepart_status="$?"
+
+	[ "$quiet" != "y" ] && log_end_msg
+}
+
+local_mount_overlay()
+{
+	[ -z "${USERDATA}" ] && return
+	[ -f "${rootmnt}/etc/.overlayfs.disabled" ] && return
+	local_device_setup "${USERDATA}" "userdata file system"
+	DATA="${DEV}"
+
+	local blkdev partnr
+	local mapper
+	case "$DATA" in /dev/mapper/* ) mapper=y ;; *) mapper=n ;; esac
+	if [[ "$DATA" == /dev/sd* ]]; then
+		blkdev=${DATA%[0-9]*}
+		partnr=$(echo $DATA | tr -d -c 0-9)
+	elif [ "${mapper}" = "y" ] ; then
+		blkdev="$DATA"
+		partnr=
+	else
+		blkdev=${DATA%p*}
+		partnr=${DATA#${blkdev}p}
+	fi
+
+	# Test block device
+	[ -b "${blkdev}" ] && \
+	   [ -b "${DATA}" ] || return
+
+	RESIZE_STAT=${datamnt}/.ext4.resized
+	if [ -z "${ROOTFSTYPE}" ] || [ "${ROOTFSTYPE}" = auto ]; then
+		FSTYPE=$(get_fstype "${ROOT}")
+	else
+		FSTYPE=${ROOTFSTYPE}
+	fi
+
+	if [ "$wipedata" = "y" ]; then
+		roflag=-w
+		remountopts=
+
+		true ${FSTYPE:="ext4"}
+		mkfs.${FSTYPE} -F -L userdata ${DATA}
+		[ $? -eq 0 ] && :> ${RESIZE_STAT} && sync
+	else
+		roflag=-r
+		remountopts="-o remount,rw"
+
+		checkfs "${DATA}" userdata "${FSTYPE}"
+	fi
+
+	# shellcheck disable=SC2086
+	mount ${roflag} ${FSTYPE:+-t "${FSTYPE}"} ${ROOTFLAGS} "${DATA}" "${datamnt?}"
+	mountoverlay_status="$?"
+
+	# Resize userdata filesystem
+	if [ -n "${remountopts}" ]; then
+		local VAR_WIPEDATA=${datamnt}/root/var/.init_wipedata
+		local VAR_WIPEDATA2=${datamnt}/root/.init_wipedata
+		if [ -f ${VAR_WIPEDATA} -o -f ${VAR_WIPEDATA2} ]; then
+			local last_error=
+			local last_part=$(parted -s $blkdev unit MiB print | awk '/^ *[0-9]+/ { p=$1; s=$2; e=$3; n=$6 } END { print p,s,e,n }')
+			local last_part_name=$(echo "$last_part" | awk '{print $4}')
+
+			local file_content=
+			if [ -f ${VAR_WIPEDATA} ]; then
+				file_content=$(cat ${VAR_WIPEDATA})
+			elif [ -f ${VAR_WIPEDATA2} ]; then
+				file_content=$(cat ${VAR_WIPEDATA2})
+			fi
+
+			# The possible contents of the /.init_wipedata file are as follows:
+			#    overlayfs=enable userdata=1000
+			#    overlayfs=enable
+			#    overlayfs=disable
+
+			# format userdata to clear .init_wipedata
+			umount ${datamnt}
+			true ${FSTYPE:="ext4"}
+			mkfs.${FSTYPE} -F -L userdata "${blkdev}p${partnr}"
+
+			# User want to keep overlayFS
+			if echo ${file_content} | grep -q "wipedata=yes\|overlayfs=enable\|overlayfs=yes\|overlayfs=on"; then
+				local userdata_size_mb=
+				local resized_flag=0
+				for x in ${file_content}; do
+					if echo ${x} | grep -q "userdata="; then
+						local num_str="${x#*=}"
+						if echo "$num_str" | grep -q "^[0-9]\+$"; then
+							userdata_size_mb=${num_str}
+						fi
+					fi
+				done
+
+				if [ ! -z ${userdata_size_mb} ]; then
+					# Resize userdata partition
+					# Partition operation will only be executed if the last partition is userdata
+					if [ "${last_part_name}" = "userdata" ]; then
+						local last_part_start=$(echo "$last_part" | awk '{print $2}')
+						local disk_size=$(blockdev --getsize64 "$blkdev")
+						local last_part_end="$((${last_part_start%%MiB} + ${userdata_size_mb}))"
+						if [ $((disk_size / 1024 / 1024)) -le ${last_part_end%%MiB} ]; then
+							last_error="error occurred, the partition layout exceeds the size of the disk."
+						else
+							# remove and re-add userdata
+							parted $blkdev rm $partnr
+							[ $? -eq 0 ] && local_part_reload_tiny "${DATA}"
+							parted $blkdev unit MiB mkpart userdata ${FSTYPE} ${last_part_start} ${last_part_end}
+							[ $? -eq 0 ] && local_part_reload "${DATA}"
+							mkfs.${FSTYPE} -F -L userdata "${blkdev}p${partnr}"
+						fi
+					else
+						last_error="error occurred, the last partition is not a userdata partition."
+					fi
+				fi
+			# User want to remove overlayFS
+			elif echo ${file_content} | grep -q "overlayfs=disable\|overlayfs=no\|overlayfs=off"; then
+				# Partition operation will only be executed if the last partition is userdata
+				if [ "${last_part_name}" = "userdata" ]; then
+					# Remove userdata partition
+					parted $blkdev rm $partnr
+					[ $? -eq 0 ] && local_part_reload_tiny "${DATA}"
+					# Extend the root partition to the end of the disk
+					umount ${rootmnt}
+					local_resize_part "${ROOT}"
+					local_resize_ext4 "${ROOT}"
+					mount -w ${FSTYPE:+-t "${FSTYPE}"} ${ROOTFLAGS} "${ROOT}" "${rootmnt}"
+					mountroot_status="$?"
+					if [ "$resizepart_status" -eq 0 ]; then
+						:> ${rootmnt}/etc/fs.resized && sync
+					fi
+					if [ "$mountroot_status" -eq 0 ]; then
+						:> ${rootmnt}/etc/.overlayfs.disabled && sync
+					fi
+
+					return ${mountroot_status}
+				else
+					last_error="error occurred, the last partition is not a userdata partition."
+				fi
+			else
+				last_error="unknown options: ${file_content}."
+			fi
+
+			mount -w ${FSTYPE:+-t "${FSTYPE}"} ${ROOTFLAGS} "${DATA}" "${datamnt}"
+			mountoverlay_status="$?"
+			if [ ${resized_flag} -eq 1 ]; then
+				:> ${RESIZE_STAT} && sync
+			fi
+
+			if [ ! -z "${last_error}" ]; then
+				echo "initfs: ${last_error}" > /dev/kmsg
+			fi
+		elif [ -f ${RESIZE_STAT} ]; then
+			mount ${remountopts} ${datamnt}
+			mountoverlay_status="$?"
+		elif [ "${FSTYPE%[234]}" = "ext" ]; then
+			umount ${datamnt}
+			local_resize_part "${DATA}"
+			local_resize_ext4 "${DATA}"
+
+			mount -w ${FSTYPE:+-t "${FSTYPE}"} ${ROOTFLAGS} "${DATA}" "${datamnt}"
+			mountoverlay_status="$?"
+
+			if [ "$resizepart_status" -eq 0 ]; then
+				:> ${RESIZE_STAT} && sync
+			fi
+		fi
+	fi
+
+	[ "$mountoverlay_status" != 0 ] && return
+
+	# Prepare & mount overlayfs
+	[ -d ${datamnt}/root ] || mkdir -p ${datamnt}/root
+	[ -d ${datamnt}/work ] || mkdir -p ${datamnt}/work
+
+	mount \
+		-t overlay overlay \
+		-o lowerdir=${rootmnt},upperdir=${datamnt}/root,workdir=${datamnt}/work \
+		/overlay
+
+	[ $? -eq 0 ] && export rootmnt=/overlay
+}
+
+local_mount_root()
+{
+	local_top
+	if [ -z "${ROOT}" ]; then
+		panic "No root device specified. Boot arguments must include a root= parameter."
+	fi
+
+	local_device_setup "${ROOT}" "root file system"
+	ROOT="${DEV}"
+
+	# Get the root filesystem type if not set
+	if [ -z "${ROOTFSTYPE}" ] || [ "${ROOTFSTYPE}" = auto ]; then
+		FSTYPE=$(get_fstype "${ROOT}")
+	else
+		FSTYPE=${ROOTFSTYPE}
+	fi
+
+	# TODO: Btrfs doesn’t support overlayfs
+	if [ "${FSTYPE}" = "btrfs" ]; then
+		USERDATA=
+		remountopts="-o remount,rw"
+	fi
+
+	local_premount
+
+	if [ -b "${USERDATA}" ]; then
+		roflag=-r
+		skipfsck=y
+	elif [ -n "${USERDATA}" ]; then
+		roflag=-r
+		remountopts="-o remount,rw"
+	elif [ "${readonly?}" = "y" ] && [ -z "$LOOP" ]; then
+		roflag=-r
+	else
+		roflag=-r
+		remountopts="-o remount,rw"
+	fi
+
+	[ -z "$skipfsck" ] && checkfs "${ROOT}" root "${FSTYPE}"
+
+	# Mount root
+	# shellcheck disable=SC2086
+	mount ${roflag} ${FSTYPE:+-t "${FSTYPE}"} ${ROOTFLAGS} "${ROOT}" "${rootmnt?}"
+	mountroot_status="$?"
+
+	# Resize root filesystem
+	if [ -n "${remountopts}" ]; then
+		RESIZE_STAT=${rootmnt}/etc/fs.resized
+
+		if [ -f ${RESIZE_STAT} ]; then
+			mount ${remountopts} ${rootmnt}
+			mountroot_status="$?"
+
+		elif [ "${FSTYPE%[234]}" = "ext" ]; then
+			umount ${rootmnt}
+			local_resize_part "${ROOT}"
+			local_resize_ext4 "${ROOT}"
+
+			mount -w ${FSTYPE:+-t "${FSTYPE}"} ${ROOTFLAGS} "${ROOT}" "${rootmnt}"
+			mountroot_status="$?"
+
+			if [ "$resizepart_status" -eq 0 ]; then
+				:> ${RESIZE_STAT} && sync
+			fi
+		elif [ "${FSTYPE}" = "btrfs" ]; then
+			umount ${rootmnt}
+			local_resize_part "${ROOT}"
+			mount -w ${FSTYPE:+-t "${FSTYPE}"} ${ROOTFLAGS} "${ROOT}" "${rootmnt}"
+			mountroot_status="$?"
+			if [ "$mountroot_status" -eq 0 ]; then
+				:> ${rootmnt}/etc/.overlayfs.disabled && sync
+				local_resize_btrfs "${ROOT}"
+				if [ "$resizepart_status" -eq 0 ]; then
+					:> ${RESIZE_STAT} && sync
+				else
+					echo "initfs: failed to resize ${ROOT} (${FSTYPE})" > /dev/kmsg
+				fi
+			else
+				echo "initfs: failed to mount ${ROOT} (${FSTYPE})" > /dev/kmsg
+			fi
+		fi
+	fi
+
+	if [ "$LOOP" ]; then
+		if [ "$mountroot_status" != 0 ]; then
+			if [ "${FSTYPE}" = ntfs ] || [ "${FSTYPE}" = vfat ]
+			then
+				panic "
+Could not mount the partition ${ROOT}.
+This could also happen if the file system is not clean because of an operating
+system crash, an interrupted boot process, an improper shutdown, or unplugging
+of a removable device without first unmounting or ejecting it.  To fix this,
+simply reboot into Windows, let it fully start, log in, run 'chkdsk /r', then
+gracefully shut down and reboot back into Windows. After this you should be
+able to reboot again and resume the installation.
+(filesystem = ${FSTYPE}, error code = $mountroot_status)
+"
+			fi
+		fi
+
+		mkdir -p /host
+		mount -o move "$rootmnt" /host
+
+		while [ ! -e "/host/${LOOP#/}" ]; do
+			panic "ALERT!  /host/${LOOP#/} does not exist.  Dropping to a shell!"
+		done
+
+		# Get the loop filesystem type if not set
+		# shellcheck disable=SC2153
+		FSTYPE="$LOOPFSTYPE"
+		if [ -z "$FSTYPE" ] || [ "$FSTYPE" = "unknown" ]; then
+			FSTYPE=$(/sbin/blkid -s TYPE -o value "/host/${LOOP#/}")
+			[ -z "$FSTYPE" ] && FSTYPE="unknown"
+		fi
+
+		if [ "$readonly" = y ]; then
+			roflag=-r
+		else
+			roflag=-w
+		fi
+
+		# FIXME This has no error checking
+		modprobe loop
+
+		# FIXME This has no error checking
+		# shellcheck disable=SC2086
+		mount ${roflag} -o loop -t ${FSTYPE} ${LOOPFLAGS} "/host/${LOOP#/}" "${rootmnt?}"
+
+		if [ -d "$rootmnt/host" ]; then
+			mount -o move /host "$rootmnt/host"
+		fi
+	fi
+}
+
+local_mount_fs()
+{
+	read_fstab_entry "$1"
+
+	local_device_setup "$MNT_FSNAME" "$1 file system"
+	MNT_FSNAME="${DEV}"
+
+	local_premount
+
+	if [ "${readonly}" = "y" ]; then
+		roflag=-r
+	else
+		roflag=-w
+	fi
+
+	if [ "$MNT_PASS" != 0 ]; then
+		checkfs "$MNT_FSNAME" "$MNT_DIR" "${MNT_TYPE}"
+	fi
+
+	# Mount filesystem
+	if ! mount ${roflag} -t "${MNT_TYPE}" -o "${MNT_OPTS}" "$MNT_FSNAME" "${rootmnt}${MNT_DIR}"; then
+		panic "Failed to mount ${MNT_FSNAME} as $MNT_DIR file system."
+	fi
+}
+
+mountroot()
+{
+	local_mount_root
+	local_mount_overlay
+}
+
+mount_top()
+{
+	# Note, also called directly in case it's overridden.
+	local_top
+}
+
+mount_premount()
+{
+	# Note, also called directly in case it's overridden.
+	local_premount
+}
+
+mount_bottom()
+{
+	# Note, also called directly in case it's overridden.
+	local_bottom
+}
