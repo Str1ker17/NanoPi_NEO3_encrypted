@@ -1,7 +1,7 @@
 .PHONY: help obtain backup flash clean
 
 SHELL := sh -x
-DD := dd status=none conv=fsync
+DD := dd status=none conv=sync,fsync,fdatasync
 PARTITION := /dev/mmcblk1p7
 INPUT ?= p7_boot.img
 
@@ -29,11 +29,12 @@ extract: p7_boot.cpio
 	@sudo rm -rf ./$@
 	# Work around the `cpio' bug with --directory and without --no-change-owner.
 	@mkdir -p $@/$@
-	@cat $< | sudo cpio --directory=$@ --extract --make-directories --preserve-modification-time --no-absolute-filenames --quiet --unconditional
+	@cat $< | sudo cpio --directory=$@ --extract --make-directories --preserve-modification-time --no-absolute-filenames --quiet --unconditional --no-preserve-owner
 	@rmdir $@/$@
 
-p7_boot_re.cpio:
-	@cd extract && sudo find . -print0 | sudo cpio --create --null --format=newc | cat > ../$@
+p7_boot_re.cpio: cryptsetup-initramfs
+	@sudo rsync -av --chmod=+x cryptsetup-initramfs/ extract/
+	@cd extract && sudo find . -print0 | sudo cpio --create --null --format=newc --owner=0:0 | cat > ../$@
 
 p7_boot_re.cpio.gz: p7_boot_re.cpio
 	@cat $< | gzip -c -n -1 > $@
@@ -45,10 +46,11 @@ p7_boot_re.img: p7_boot_re.cpio.gz
 	@cat $< >> $@
 
 backup:
-	@$(DD) if=$(PARTITION) of=p7_boot.backup.img conv=fsync
+	@sudo $(DD) if=$(PARTITION) of=p7_boot.backup.img conv=fsync
 
 flash: p7_boot_re.img backup
-	@$(DD) if=$< of=$(PARTITION) conv=fsync
+	@sudo $(DD) if=$< of=$(PARTITION) conv=fsync
+	@sudo blockdev --flushbufs $(PARTITION)
 
 clean:
 	@rm -rf p7_boot.img.size p7_boot.cpio.gz p7_boot.img.crc p7_boot.cpio p7_boot_re.cpio p7_boot_re.cpio.gz p7_boot_re.img
