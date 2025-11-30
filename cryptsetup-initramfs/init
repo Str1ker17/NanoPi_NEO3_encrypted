@@ -73,7 +73,7 @@ export init=/sbin/init
 export readonly=n
 export rootmnt=/root
 export debug=
-export panic=
+export panic=15
 export blacklist=
 export resume=
 export resume_offset=
@@ -242,6 +242,10 @@ for x in $(cat /proc/cmdline); do
 	esac
 done
 
+#debug=y
+#quiet=n
+#set -x
+
 # Default to BOOT=local if no boot script defined.
 if [ -z "${BOOT}" ]; then
 	BOOT=local
@@ -310,25 +314,28 @@ mount_top
 #cryptsetup luksOpen --key-file /sys/bus/nvmem/devices/rockchip-efuse0/nvmem --header /xtra/ethernet.raw /dev/mmcblk0p8 luks_system
 #mount /dev/mapper/luks_system /system
 #mount /dev/mmcblk0p9 /userdata
-#sh -i
 
 set -e
-modprobe encrypted_keys || insmod /usr/lib/modules/$(uname -r)/kernel/security/keys/encrypted-keys/encrypted-keys.ko
-modprobe dm_crypt || insmod /usr/lib/modules/$(uname -r)/kernel/drivers/md/dm-crypt.ko
-openssl enc -d -aes-256-ctr -pbkdf2 -in /usr/lib/firmware/ethernet.bin -pass pass:hujpizda -out /usr/lib/firmware/ethernet.raw
+
+modprobe dm_crypt
+
+openssl enc -d -aes-256-ctr -pbkdf2 -nosalt -in /usr/lib/firmware/ethernet.bin -pass pass:hujpizda -out /usr/lib/firmware/ethernet.raw
 rm -f /usr/lib/firmware/ethernet.bin
 cryptsetup luksOpen --key-file /sys/bus/nvmem/devices/rockchip-efuse0/nvmem --header /usr/lib/firmware/ethernet.raw "${ROOT}" luks_system
 rm -f /usr/lib/firmware/ethernet.raw
 ROOT=/dev/mapper/luks_system
-openssl enc -d -aes-256-ctr -pbkdf2 -in /usr/lib/firmware/wifi.bin -pass pass:hujpizda -out /usr/lib/firmware/wifi.raw
+
+if [ -b "${USERDATA}" ] ; then
+openssl enc -d -aes-256-ctr -pbkdf2 -nosalt -in /usr/lib/firmware/wifi.bin -pass pass:hujpizda -out /usr/lib/firmware/wifi.raw
 rm -f /usr/lib/firmware/wifi.bin
 cryptsetup luksOpen --key-file /sys/bus/nvmem/devices/rockchip-efuse0/nvmem --header /usr/lib/firmware/wifi.raw "${USERDATA}" luks_userdata
 rm -f /usr/lib/firmware/wifi.raw
 USERDATA=/dev/mapper/luks_userdata
-set +e
+else
+USERDATA=
+fi
 
-# remove extra files from root
-sh -i
+set +e
 
 mount_premount
 mountroot
