@@ -54,3 +54,4 @@ flash: p7_boot_re.img backup
 
 clean:
 	@rm -rf p7_boot.img.size p7_boot.cpio.gz p7_boot.img.crc p7_boot.cpio p7_boot_re.cpio p7_boot_re.cpio.gz p7_boot_re.img
+	@sudo rm -rf extract

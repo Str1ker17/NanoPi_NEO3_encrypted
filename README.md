@@ -21,6 +21,8 @@ Let me list mandatory things:
 /usr/lib/modules/6.1.63/modules.* (likely can be reduced)
 ```
 
+Run `sudo depmod -a -vw -b cryptsetup-initramfs/usr 6.1.63` after collecting files
+
 ### Utilities & shared libraries
 
 The suffixes may not match 1:1 to the listed.

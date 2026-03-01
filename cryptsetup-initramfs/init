@@ -306,14 +306,9 @@ parse_numeric "${ROOT}"
 maybe_break mountroot
 mount_top
 
-# dev
-#modprobe dm_crypt
-#mkdir /system /system_ro /xtra /userdata
-#mount /dev/mmcblk0p10 /xtra
-##mount -o ro /xtra/system_new.img /system_ro
-#cryptsetup luksOpen --key-file /sys/bus/nvmem/devices/rockchip-efuse0/nvmem --header /xtra/ethernet.raw /dev/mmcblk0p8 luks_system
-#mount /dev/mapper/luks_system /system
-#mount /dev/mmcblk0p9 /userdata
+#echo powersave | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+echo 0 | tee /sys/devices/system/cpu/cpu1/online /sys/devices/system/cpu/cpu2/online /sys/devices/system/cpu/cpu3/online
+echo 408000 | tee /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq
 
 set -e
 
